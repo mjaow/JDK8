@@ -904,6 +904,7 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
             int c = ctl.get();
             int rs = runStateOf(c);
 
+            //当线程池被关闭，则不再创建工作线程
             // Check if queue empty only if necessary.
             if (rs >= SHUTDOWN &&
                 ! (rs == SHUTDOWN &&
@@ -913,9 +914,14 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
 
             for (;;) {
                 int wc = workerCountOf(c);
+
+                //当工作线程数量超过限制，则不再创建
                 if (wc >= CAPACITY ||
                     wc >= (core ? corePoolSize : maximumPoolSize))
                     return false;
+
+                //由于需要创建工作线程，所以c的值也需要原子递增
+                // 如果CAS递增失败，则重试；如果成功，则跳出外层循环
                 if (compareAndIncrementWorkerCount(c))
                     break retry;
                 c = ctl.get();  // Re-read ctl
@@ -929,9 +935,16 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
         boolean workerAdded = false;
         Worker w = null;
         try {
+            //创建工作线程，同时带上初始化工作任务firstTask
+            //1. 如果firstTask!=null，则工作线程在启动的时候，会立马执行该任务
+            //2. 如果firstTask==null，则工作线程在启动的时候，会拉取工作队列中的任务，并执行
+            //这样就保证了，创建的Thread，及时没有指定Runnable任务，它也会自动获取队列中的任务执行，完美的做到线程和任务的解耦
             w = new Worker(firstTask);
             final Thread t = w.thread;
             if (t != null) {
+                //在维护工作线程的集合时，采用HashSet + ReentrantLock，而不是concurrent hashmap(hashset)这种结构，
+                //主要是因为除了维护工作线程的集合，还维护了其他数量和状态信息。使用锁，处理起来更加简便，并且对性能影响不会很大，
+                //因为其中的几个操作都很轻量级
                 final ReentrantLock mainLock = this.mainLock;
                 mainLock.lock();
                 try {
@@ -954,6 +967,7 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
                     mainLock.unlock();
                 }
                 if (workerAdded) {
+                    //启动工作线程，执行初始化任务，或者从队列中获取任务来执行
                     t.start();
                     workerStarted = true;
                 }
@@ -1069,6 +1083,12 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
             }
 
             try {
+                //这段逻辑揭示了keepAliveTime的多重作用，从表面看它是工作线程从工作队列中获取任务的超时时间，实际上代表了
+                //该工作线程在空闲多久后就被回收，因为一旦获取任务超时，就代表经过这段空闲期，getTask获取到的是空，会导致
+                //currentThread停止轮询工作队列，从而直接进入processWorkerExit逻辑，并被回收
+
+                //1. 当allowCoreThreadTimeOut=true，则工作线程在空闲keepAliveTime之后，就会被回收（核心+非核心）
+                //2. 当allowCoreThreadTimeOut=false，并且发现非核心线程空闲keepAliveTime，则该线程会被回收；如果是核心线程，会一直阻塞，直到获取到任务
                 Runnable r = timed ?
                     workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS) :
                     workQueue.take();
@@ -1131,6 +1151,9 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
         w.unlock(); // allow interrupts
         boolean completedAbruptly = true;
         try {
+            //工作线程执行任务的主要逻辑
+            //1. 当初始化任务还没执行，则优先执行该任务
+            //2. 当工作队列还有任务没执行，则取出任务，并执行
             while (task != null || (task = getTask()) != null) {
                 w.lock();
                 // If pool is stopping, ensure thread is interrupted;
@@ -1362,20 +1385,35 @@ public class ThreadPoolExecutor extends AbstractExecutorService {
          * thread.  If it fails, we know we are shut down or saturated
          * and so reject the task.
          */
+
+        /**
+         * 1. 当工作线程数量小于corePoolSize，就创建线程并执行任务
+         * 2. 当工作线程数量等于corePoolSize，就将任务放入工作队列，并等待工作线程处理
+         * 3. 当上述条件都不满足，说明核心线程和工作队列都已经饱和，需要创建额外的非核心线程并执行任务
+         *
+         * 如果一旦发现线程池不是running状态，或者创建非核心线程失败的情况，都需要调用自定义handler拒绝工作任务的提交
+         */
         int c = ctl.get();
+        //c是两个值的组合，其中高位是线程池状态，低位是工作线程数量。这是一种特殊的优化技术
+
         if (workerCountOf(c) < corePoolSize) {
+            //创建核心线程
             if (addWorker(command, true))
                 return;
             c = ctl.get();
         }
+        //任务插入队列
         if (isRunning(c) && workQueue.offer(command)) {
             int recheck = ctl.get();
             if (! isRunning(recheck) && remove(command))
                 reject(command);
             else if (workerCountOf(recheck) == 0)
+                //当任务插入队列，但却发现工作线程数量为0，则先创建一个非核心线程，保证有独立的线程来执行队列中的任务
                 addWorker(null, false);
         }
+        //创建非核心线程
         else if (!addWorker(command, false))
+            //添加非核心线程失败，放心的拒绝该任务
             reject(command);
     }
 
